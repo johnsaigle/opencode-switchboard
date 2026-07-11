@@ -6,6 +6,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use anyhow::{anyhow, Context};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -139,6 +142,10 @@ impl App {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    if env::var("TMUX").is_err() {
+        return attach_to_existing_session();
+    }
+
     let options = Options::parse(env::args_os().skip(1))?;
     let panes = discover_tmux_panes().unwrap_or_else(|err| {
         eprintln!("failed to discover tmux panes: {err:#}");
@@ -187,6 +194,62 @@ impl Options {
 
 fn usage() -> &'static str {
     "usage: opencode-switchboard [-s|--search <phrase>]"
+}
+
+fn attach_to_existing_session() -> anyhow::Result<()> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}:#{session_created}"])
+        .output()
+        .context("failed to execute tmux list-sessions")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "tmux list-sessions exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("tmux output was not UTF-8")?;
+
+    let sessions: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+
+    let name = match sessions.len() {
+        0 => {
+            return Err(anyhow!(
+                "not inside tmux and no existing tmux sessions found; start one with 'tmux new-session'"
+            ));
+        }
+        1 => sessions[0]
+            .split(':')
+            .next()
+            .ok_or_else(|| anyhow!("failed to parse tmux session name"))?,
+        _ => sessions
+            .iter()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, ':');
+                let name = parts.next()?;
+                let created: u64 = parts.next()?.parse().ok()?;
+                Some((name, created))
+            })
+            .max_by_key(|(_, created)| *created)
+            .map(|(name, _)| name)
+            .ok_or_else(|| anyhow!("failed to determine most recent tmux session"))?,
+    };
+
+    #[cfg(unix)]
+    {
+        let err = Command::new("tmux")
+            .args(["attach-session", "-t", name])
+            .exec();
+        Err(anyhow!("failed to exec tmux attach-session: {err}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        Err(anyhow!("auto-attach to tmux session is only supported on Unix"))
+    }
 }
 
 pub fn discover_tmux_panes() -> anyhow::Result<Vec<Pane>> {
