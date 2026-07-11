@@ -1,4 +1,10 @@
-use std::{env, ffi::OsString, io, process::Command, time::Duration};
+use std::{
+    env,
+    ffi::OsString,
+    io,
+    process::Command,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Context};
 use crossterm::{
@@ -13,19 +19,23 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     DefaultTerminal, Frame,
 };
+use serde::Deserialize;
 
 const TMUX_FORMAT: &str =
     "#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}";
+const IDLE_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneState {
     Live,
+    Idle,
 }
 
 impl PaneState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
+            Self::Idle => "idle",
         }
     }
 }
@@ -46,6 +56,13 @@ impl Pane {
             .strip_prefix("OC | ")
             .unwrap_or(&self.pane_title)
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct OpenCodeSession {
+    pub title: String,
+    pub directory: String,
+    pub updated: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +106,12 @@ impl App {
         if self.filtered.is_empty() || self.selected >= self.filtered.len() {
             self.selected = 0;
         }
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.apply_filter();
+        self.message = "filter cleared".to_owned();
     }
 
     fn refresh(&mut self) {
@@ -186,8 +209,84 @@ pub fn discover_tmux_panes() -> anyhow::Result<Vec<Pane>> {
         .filter_map(parse_tmux_pane_line)
         .filter(is_opencode_pane)
         .collect::<Vec<_>>();
+    if let Ok(sessions) = list_opencode_sessions() {
+        enrich_panes_from_sessions(&mut panes, &sessions, current_time_millis());
+    }
     sort_panes(&mut panes);
     Ok(panes)
+}
+
+pub fn list_opencode_sessions() -> anyhow::Result<Vec<OpenCodeSession>> {
+    let output = Command::new("opencode")
+        .args(["session", "list", "--format", "json"])
+        .output()
+        .context("failed to execute opencode session list")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "opencode session list exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    serde_json::from_slice(&output.stdout).context("failed to parse opencode session list JSON")
+}
+
+pub fn enrich_panes_from_sessions(panes: &mut [Pane], sessions: &[OpenCodeSession], now_ms: u64) {
+    for pane in panes {
+        if let Some(session) = best_matching_session(pane, sessions) {
+            pane.pane_title = session.title.clone();
+            pane.state = classify_session_state(session.updated, now_ms);
+        }
+    }
+}
+
+pub fn enrich_pane_titles(panes: &mut [Pane], sessions: &[OpenCodeSession]) {
+    enrich_panes_from_sessions(panes, sessions, current_time_millis());
+}
+
+pub fn classify_session_state(updated_ms: u64, now_ms: u64) -> PaneState {
+    let idle_threshold_ms = IDLE_THRESHOLD.as_millis() as u64;
+    if now_ms.saturating_sub(updated_ms) >= idle_threshold_ms {
+        PaneState::Idle
+    } else {
+        PaneState::Live
+    }
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn best_matching_session<'a>(
+    pane: &Pane,
+    sessions: &'a [OpenCodeSession],
+) -> Option<&'a OpenCodeSession> {
+    let pane_title = normalize_truncated_title(pane.display_title());
+    sessions
+        .iter()
+        .filter(|session| session.directory == pane.current_path)
+        .filter(|session| {
+            let session_title = session.title.to_lowercase();
+            let pane_title = pane_title.to_lowercase();
+            session_title == pane_title
+                || session_title.starts_with(&pane_title)
+                || pane_title.starts_with(&session_title)
+        })
+        .max_by_key(|session| session.updated)
+}
+
+fn normalize_truncated_title(title: &str) -> String {
+    title
+        .trim()
+        .trim_end_matches('…')
+        .trim_end_matches("...")
+        .trim()
+        .to_owned()
 }
 
 pub fn parse_tmux_pane_line(line: &str) -> Option<Pane> {
@@ -313,6 +412,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> anyhow::Result<bool> {
             app.refresh();
             Ok(false)
         }
+        KeyCode::Char('c') => {
+            app.clear_filter();
+            Ok(false)
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_down();
             Ok(false)
@@ -335,6 +438,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> anyhow::Result<bool> {
 }
 
 fn handle_filter_key(key: KeyEvent, app: &mut App) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        app.clear_filter();
+        return false;
+    }
+
     match key.code {
         KeyCode::Enter | KeyCode::Esc => {
             app.mode = InputMode::Normal;
@@ -415,7 +523,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_stateful_widget(table, chunks[1], &mut table_state);
 
     let help = if app.message.is_empty() {
-        "Enter jump  / filter  r refresh  q quit".to_owned()
+        "Enter jump  / filter  c clear  r refresh  q quit".to_owned()
     } else {
         app.message.clone()
     };
@@ -487,6 +595,139 @@ mod tests {
         assert_eq!(filter_panes(&panes, "SWITCHBOARD"), vec![1]);
         assert_eq!(filter_panes(&panes, "tools"), vec![1]);
         assert_eq!(filter_panes(&panes, ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn clears_prepopulated_filter() {
+        let panes = vec![
+            pane(
+                "OC | Wormhole review",
+                "/Users/john/coding/wormhole",
+                "wh:1.0",
+            ),
+            pane(
+                "OC | PRD implementation",
+                "/Users/john/coding/opencode-switchboard",
+                "tools:2.0",
+            ),
+        ];
+        let mut app = App::with_filter(panes, "wormhole".to_owned());
+
+        app.clear_filter();
+
+        assert!(app.filter.is_empty());
+        assert_eq!(app.filtered, vec![0, 1]);
+        assert_eq!(app.message, "filter cleared");
+    }
+
+    #[test]
+    fn classifies_recent_session_as_live() {
+        let now = 1_000_000;
+
+        assert_eq!(classify_session_state(now - 1_000, now), PaneState::Live);
+    }
+
+    #[test]
+    fn classifies_old_session_as_idle() {
+        let now = IDLE_THRESHOLD.as_millis() as u64 + 1_000;
+        let updated = now - IDLE_THRESHOLD.as_millis() as u64;
+
+        assert_eq!(classify_session_state(updated, now), PaneState::Idle);
+    }
+
+    #[test]
+    fn classifies_future_session_timestamp_as_live() {
+        assert_eq!(
+            classify_session_state(2_000_000, 1_000_000),
+            PaneState::Live
+        );
+    }
+
+    #[test]
+    fn enriches_truncated_tmux_title_from_opencode_session_metadata() {
+        let mut panes = vec![pane(
+            "OC | Very important wormhole security review...",
+            "/Users/john/coding/wormhole",
+            "wh:1.0",
+        )];
+        let sessions = vec![OpenCodeSession {
+            title: "Very important wormhole security review with the full useful title".to_owned(),
+            directory: "/Users/john/coding/wormhole".to_owned(),
+            updated: 10,
+        }];
+
+        enrich_panes_from_sessions(&mut panes, &sessions, 20);
+
+        assert_eq!(
+            panes[0].display_title(),
+            "Very important wormhole security review with the full useful title"
+        );
+        assert_eq!(panes[0].state, PaneState::Live);
+    }
+
+    #[test]
+    fn enriches_unicode_ellipsis_tmux_title_from_opencode_session_metadata() {
+        let mut panes = vec![pane(
+            "OC | Very important wormhole security review…",
+            "/Users/john/coding/wormhole",
+            "wh:1.0",
+        )];
+        let sessions = vec![OpenCodeSession {
+            title: "Very important wormhole security review with the full useful title".to_owned(),
+            directory: "/Users/john/coding/wormhole".to_owned(),
+            updated: 10,
+        }];
+
+        enrich_panes_from_sessions(&mut panes, &sessions, 20);
+
+        assert_eq!(
+            panes[0].display_title(),
+            "Very important wormhole security review with the full useful title"
+        );
+    }
+
+    #[test]
+    fn does_not_enrich_from_another_directory() {
+        let mut panes = vec![pane(
+            "OC | Very important wormhole security review...",
+            "/Users/john/coding/wormhole",
+            "wh:1.0",
+        )];
+        let sessions = vec![OpenCodeSession {
+            title: "Very important wormhole security review with the full useful title".to_owned(),
+            directory: "/Users/john/coding/other".to_owned(),
+            updated: 10,
+        }];
+
+        enrich_panes_from_sessions(&mut panes, &sessions, 20);
+
+        assert_eq!(
+            panes[0].display_title(),
+            "Very important wormhole security review..."
+        );
+        assert_eq!(panes[0].state, PaneState::Live);
+    }
+
+    #[test]
+    fn enriches_state_as_idle_for_old_matched_session() {
+        let mut panes = vec![pane(
+            "OC | Very important wormhole security review...",
+            "/Users/john/coding/wormhole",
+            "wh:1.0",
+        )];
+        let sessions = vec![OpenCodeSession {
+            title: "Very important wormhole security review with the full useful title".to_owned(),
+            directory: "/Users/john/coding/wormhole".to_owned(),
+            updated: 10,
+        }];
+
+        enrich_panes_from_sessions(
+            &mut panes,
+            &sessions,
+            10 + IDLE_THRESHOLD.as_millis() as u64,
+        );
+
+        assert_eq!(panes[0].state, PaneState::Idle);
     }
 
     #[test]
