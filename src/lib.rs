@@ -142,17 +142,38 @@ impl App {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    if env::var("TMUX").is_err() {
+    let options = Options::parse(env::args_os().skip(1))?;
+    let inside_tmux = env::var_os("TMUX").is_some();
+
+    let panes = match discover_tmux_panes() {
+        Ok(panes) => panes,
+        // Outside tmux there is no session to fall back to, so a failure here
+        // (typically "no server running") is fatal and worth explaining.
+        Err(err) if !inside_tmux => {
+            return Err(err.context(
+                "not inside tmux and no tmux server is reachable; start one with 'tmux new-session'",
+            ));
+        }
+        Err(err) => {
+            eprintln!("failed to discover tmux panes: {err:#}");
+            Vec::new()
+        }
+    };
+
+    // Outside tmux with nothing to pick, keep the old convenience of dropping
+    // into the most recently created session.
+    if !inside_tmux && panes.is_empty() {
         return attach_to_existing_session();
     }
 
-    let options = Options::parse(env::args_os().skip(1))?;
-    let panes = discover_tmux_panes().unwrap_or_else(|err| {
-        eprintln!("failed to discover tmux panes: {err:#}");
-        Vec::new()
-    });
     let app = App::with_filter(panes, options.search.unwrap_or_default());
-    run_tui(app)
+    // The picker runs first in both cases; the jump happens only after the
+    // terminal has been restored so that `exec tmux attach` inherits a sane tty.
+    match run_tui(app)? {
+        Some(target) if inside_tmux => jump_to_pane(&target),
+        Some(target) => attach_to_pane(&target),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -210,8 +231,7 @@ fn attach_to_existing_session() -> anyhow::Result<()> {
         ));
     }
 
-    let stdout =
-        String::from_utf8(output.stdout).context("tmux output was not UTF-8")?;
+    let stdout = String::from_utf8(output.stdout).context("tmux output was not UTF-8")?;
 
     let sessions: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
 
@@ -238,18 +258,7 @@ fn attach_to_existing_session() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow!("failed to determine most recent tmux session"))?,
     };
 
-    #[cfg(unix)]
-    {
-        let err = Command::new("tmux")
-            .args(["attach-session", "-t", name])
-            .exec();
-        Err(anyhow!("failed to exec tmux attach-session: {err}"))
-    }
-
-    #[cfg(not(unix))]
-    {
-        Err(anyhow!("auto-attach to tmux session is only supported on Unix"))
-    }
+    exec_attach(name)
 }
 
 pub fn discover_tmux_panes() -> anyhow::Result<Vec<Pane>> {
@@ -403,6 +412,57 @@ fn is_opencode_pane(pane: &Pane) -> bool {
     matches!(pane.current_command.as_str(), "opencode" | "opencode.exe")
 }
 
+/// Returns the session component of a `session:window.pane` target. tmux
+/// forbids `:` in session names, so splitting on the last `:` is unambiguous.
+fn session_of_target(target: &str) -> &str {
+    target
+        .rsplit_once(':')
+        .map_or(target, |(session, _)| session)
+}
+
+fn run_tmux(args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute tmux {}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "tmux {} exited with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Used when the switchboard runs outside tmux: focus the chosen pane on the
+/// server, then replace this process with a client attached to its session.
+fn attach_to_pane(target: &str) -> anyhow::Result<()> {
+    run_tmux(&["select-window", "-t", target])?;
+    run_tmux(&["select-pane", "-t", target])?;
+    exec_attach(session_of_target(target))
+}
+
+fn exec_attach(session: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let err = Command::new("tmux")
+            .args(["attach-session", "-t", session])
+            .exec();
+        Err(anyhow!("failed to exec tmux attach-session: {err}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        Err(anyhow!(
+            "auto-attach to tmux session is only supported on Unix"
+        ))
+    }
+}
+
 fn jump_to_pane(target: &str) -> anyhow::Result<()> {
     let output = Command::new("tmux")
         .args(["switch-client", "-t", target])
@@ -420,7 +480,7 @@ fn jump_to_pane(target: &str) -> anyhow::Result<()> {
     }
 }
 
-fn run_tui(app: App) -> anyhow::Result<()> {
+fn run_tui(app: App) -> anyhow::Result<Option<String>> {
     enable_raw_mode().context("failed to enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
     let terminal = ratatui::init();
@@ -434,15 +494,25 @@ fn run_tui(app: App) -> anyhow::Result<()> {
     result
 }
 
-fn run_app(mut terminal: DefaultTerminal, mut app: App) -> anyhow::Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum KeyOutcome {
+    Continue,
+    Quit,
+    Selected(String),
+}
+
+fn run_app(mut terminal: DefaultTerminal, mut app: App) -> anyhow::Result<Option<String>> {
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(key) if handle_key(key, &mut app)? => return Ok(()),
-                Event::Key(_)
-                | Event::Mouse(_)
+                Event::Key(key) => match handle_key(key, &mut app) {
+                    KeyOutcome::Continue => {}
+                    KeyOutcome::Quit => return Ok(None),
+                    KeyOutcome::Selected(target) => return Ok(Some(target)),
+                },
+                Event::Mouse(_)
                 | Event::Resize(_, _)
                 | Event::FocusGained
                 | Event::FocusLost
@@ -452,58 +522,60 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> anyhow::Result<()> {
     }
 }
 
-fn handle_key(key: KeyEvent, app: &mut App) -> anyhow::Result<bool> {
+fn handle_key(key: KeyEvent, app: &mut App) -> KeyOutcome {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Ok(true);
+        return KeyOutcome::Quit;
     }
 
     match app.mode {
         InputMode::Normal => handle_normal_key(key, app),
-        InputMode::Filtering => Ok(handle_filter_key(key, app)),
+        InputMode::Filtering => {
+            handle_filter_key(key, app);
+            KeyOutcome::Continue
+        }
     }
 }
 
-fn handle_normal_key(key: KeyEvent, app: &mut App) -> anyhow::Result<bool> {
+fn handle_normal_key(key: KeyEvent, app: &mut App) -> KeyOutcome {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Ok(true),
+        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
         KeyCode::Char('/') => {
             app.mode = InputMode::Filtering;
             app.message = "type to filter, Enter/Esc to finish".to_owned();
-            Ok(false)
+            KeyOutcome::Continue
         }
         KeyCode::Char('r') => {
             app.refresh();
-            Ok(false)
+            KeyOutcome::Continue
         }
         KeyCode::Char('c') => {
             app.clear_filter();
-            Ok(false)
+            KeyOutcome::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_down();
-            Ok(false)
+            KeyOutcome::Continue
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_up();
-            Ok(false)
+            KeyOutcome::Continue
         }
         KeyCode::Enter => {
-            if let Some(target) = app.selected_pane().map(|pane| pane.target.clone()) {
-                jump_to_pane(&target)?;
-                Ok(true)
+            if let Some(pane) = app.selected_pane() {
+                KeyOutcome::Selected(pane.target.clone())
             } else {
                 app.message = "no pane selected".to_owned();
-                Ok(false)
+                KeyOutcome::Continue
             }
         }
-        _ => Ok(false),
+        _ => KeyOutcome::Continue,
     }
 }
 
-fn handle_filter_key(key: KeyEvent, app: &mut App) -> bool {
+fn handle_filter_key(key: KeyEvent, app: &mut App) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
         app.clear_filter();
-        return false;
+        return;
     }
 
     match key.code {
@@ -521,7 +593,6 @@ fn handle_filter_key(key: KeyEvent, app: &mut App) -> bool {
         }
         _ => {}
     }
-    false
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
@@ -617,6 +688,57 @@ mod tests {
             pane_title: title.to_owned(),
             state: PaneState::Live,
         }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn session_of_target_strips_window_and_pane() {
+        assert_eq!(session_of_target("notes:0.1"), "notes");
+        assert_eq!(session_of_target("my-proj:12.3"), "my-proj");
+        assert_eq!(session_of_target("bare"), "bare");
+    }
+
+    #[test]
+    fn enter_returns_selected_target_instead_of_jumping() {
+        let mut app = App::with_filter(
+            vec![pane("alpha", "/a", "s1:0.0"), pane("beta", "/b", "s2:1.2")],
+            String::new(),
+        );
+        app.move_down();
+        assert_eq!(
+            handle_key(key(KeyCode::Enter), &mut app),
+            KeyOutcome::Selected("s2:1.2".to_owned())
+        );
+    }
+
+    #[test]
+    fn enter_with_no_panes_keeps_picker_open() {
+        let mut app = App::with_filter(Vec::new(), String::new());
+        assert_eq!(
+            handle_key(key(KeyCode::Enter), &mut app),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.message, "no pane selected");
+    }
+
+    #[test]
+    fn quit_keys_return_quit() {
+        let mut app = App::with_filter(Vec::new(), String::new());
+        assert_eq!(
+            handle_key(key(KeyCode::Char('q')), &mut app),
+            KeyOutcome::Quit
+        );
+        assert_eq!(handle_key(key(KeyCode::Esc), &mut app), KeyOutcome::Quit);
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut app
+            ),
+            KeyOutcome::Quit
+        );
     }
 
     #[test]
